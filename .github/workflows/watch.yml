@@ -1,0 +1,50 @@
+name: watch
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Send a test alert regardless of state"
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency: { group: watch, cancel-in-progress: false }
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check Pi heartbeat
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TEST_ALERT: ${{ inputs.test_alert }}
+          STALE_MIN: "20"
+        run: |
+          set -euo pipefail
+          send() {
+            curl -fsS -m 15 "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=$1" >/dev/null
+          }
+          now=$(date -u +%s); minute=$(date -u +%M)
+          if [ "${TEST_ALERT:-false}" = "true" ]; then
+            send "🧪 Pi5 watcher test: alerts reach you. (manual run)"; echo "test sent"; exit 0
+          fi
+          if ! sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/heartbeat" --jq .sha 2>/dev/null); then
+            echo "no heartbeat branch yet"; exit 0
+          fi
+          seen=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}" --jq .commit.committer.date)
+          status=$(gh api "repos/${GITHUB_REPOSITORY}/contents/status.txt?ref=${sha}" --jq .content | base64 -d | tr -dc 'a-z')
+          age=$(( (now - $(date -u -d "$seen" +%s)) / 60 ))
+          echo "last seen ${seen} (${age} min ago), status=${status}"
+          # Alert on the first stale check, then roughly hourly while still down.
+          first_window=$(( age > STALE_MIN && age <= STALE_MIN + 10 ))
+          hourly=$(( age > STALE_MIN && 10#$minute < 10 ))
+          if [ $first_window -eq 1 ] || [ $hourly -eq 1 ]; then
+            send "🚨 Pi5 is SILENT: no heartbeat for ${age} min (last seen ${seen} UTC). Agents are likely down. Check power and network."
+          elif [ "$status" = "degraded" ] && [ "$age" -le 10 ] && [ $(( 10#$minute % 30 )) -lt 10 ]; then
+            send "⚠️ Pi5 is up but DEGRADED (Hermes down or disk ≥90%). Last seen ${seen} UTC."
+          fi
